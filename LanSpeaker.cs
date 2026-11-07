@@ -964,6 +964,14 @@ namespace LanSpeaker
 
         public float TakePeak() { lock (this) { float p = peak; peak = 0; return p; } }
 
+        public bool IsLocal;   // このPC自身の音（受信バッファは使わない）
+
+        public void PushPeak(float p)
+        {
+            lock (this) { if (p > peak) peak = p; }
+            if (p > 0.001f) Interlocked.Exchange(ref LastAudioTicks, DateTime.UtcNow.Ticks);
+        }
+
         public void Write(byte[] b, int off, int frames, uint seq) { WriteAt(b, off, frames, seq, DateTime.UtcNow.Ticks); }
 
         public void WriteAt(byte[] b, int off, int frames, uint seq, long now)
@@ -1366,6 +1374,251 @@ namespace LanSpeaker
     }
 
     // =====================================================================
+    //  受信側PC自身の音（このPCのほかのアプリ）の音量・左右・ミュート
+    //   Windows の「アプリごとの音量」を左右チャンネル別に操作する。
+    //   このソフト自身の音は対象外。止めるときは元の音量に戻す。
+    // =====================================================================
+    [ComImport, Guid("77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IAudioSessionManager2
+    {
+        void GetAudioSessionControl(IntPtr guid, int flags, out IntPtr ctl);
+        void GetSimpleAudioVolume(IntPtr guid, int flags, out IntPtr vol);
+        void GetSessionEnumerator(out IAudioSessionEnumerator e);
+    }
+
+    [ComImport, Guid("E2F5BB11-0570-40CA-ACDD-3AA01277DEE8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IAudioSessionEnumerator
+    {
+        void GetCount(out int count);
+        void GetSession(int index, [MarshalAs(UnmanagedType.IUnknown)] out object session);
+    }
+
+    [ComImport, Guid("bfb7ff88-7239-4fc9-8fa2-07c950be9c6d"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IAudioSessionControl2
+    {
+        void GetState(out int state);
+        void GetDisplayName([MarshalAs(UnmanagedType.LPWStr)] out string name);
+        void SetDisplayName([MarshalAs(UnmanagedType.LPWStr)] string name, ref Guid ctx);
+        void GetIconPath([MarshalAs(UnmanagedType.LPWStr)] out string path);
+        void SetIconPath([MarshalAs(UnmanagedType.LPWStr)] string path, ref Guid ctx);
+        void GetGroupingParam(out Guid g);
+        void SetGroupingParam(ref Guid g, ref Guid ctx);
+        void RegisterAudioSessionNotification(IntPtr n);
+        void UnregisterAudioSessionNotification(IntPtr n);
+        void GetSessionIdentifier([MarshalAs(UnmanagedType.LPWStr)] out string id);
+        void GetSessionInstanceIdentifier([MarshalAs(UnmanagedType.LPWStr)] out string id);
+        void GetProcessId(out int pid);
+        [PreserveSig] int IsSystemSoundsSession();
+        void SetDuckingPreference(bool optOut);
+    }
+
+    [ComImport, Guid("1C158861-B533-4B30-B1CF-E853E51C59B8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IChannelAudioVolume
+    {
+        void GetChannelCount(out int count);
+        void SetChannelVolume(int index, float level, ref Guid ctx);
+        void GetChannelVolume(int index, out float level);
+        void SetAllVolumes(int count, IntPtr levels, ref Guid ctx);
+        void GetAllVolumes(int count, IntPtr levels);
+    }
+
+    [ComImport, Guid("C02216F6-8C67-4B5B-9D00-D008E73E0064"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IAudioMeterInformation
+    {
+        void GetPeakValue(out float peak);
+    }
+
+    class LocalAudio
+    {
+        static Guid IID_SessionManager2 = new Guid("77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F");
+        static Guid Ctx = new Guid("6b1f3c1e-4d0a-4c7e-9a51-1d4a2c8f7e10");
+
+        class Info
+        {
+            public float[] Orig;     // 触る前の音量
+            public float[] LastSet;  // 最後にこのソフトが設定した値
+            public bool Applied;
+        }
+
+        public readonly SourceStream Src;   // 画面との受け渡し（音量・左右・ミュート・メーター）
+        public Func<string> DeviceId;        // "" = 既定のスピーカー
+        public Func<float> MasterVolume;     // 「全体の音量」
+        readonly int myPid = Process.GetCurrentProcess().Id;
+        readonly Dictionary<string, Info> infos = new Dictionary<string, Info>();
+        string curDevice;
+        volatile bool running;
+        Thread th;
+        public volatile string Error;
+        public int SessionCount;
+        public int TestOnlyPid;   // テスト用：このプロセスの音だけ操作する
+
+        public LocalAudio()
+        {
+            Src = new SourceStream { Id = 0, Name = "このPC（" + Environment.MachineName + "）", Named = true, IsLocal = true };
+        }
+
+        public void Start()
+        {
+            running = true;
+            th = new Thread(Loop);
+            th.IsBackground = true;
+            th.Start();
+        }
+
+        // 止める（元の音量に戻すまで待つ）
+        public void Stop()
+        {
+            if (!running) return;
+            running = false;
+            if (th != null) th.Join(3000);
+        }
+
+        void Loop()
+        {
+            while (running)
+            {
+                try { Pass(false); Error = null; }
+                catch (Exception ex) { Error = ex.Message; }
+                for (int i = 0; i < 5 && running; i++) Thread.Sleep(50);
+            }
+            try { Pass(true); } catch { }   // 終了時：元に戻す
+        }
+
+        // 左右それぞれの倍率（左右バランス）
+        void Factors(out float fl, out float fr, out float fo)
+        {
+            float m = MasterVolume != null ? Math.Max(0f, Math.Min(1f, MasterVolume())) : 1f;
+            float v = Src.Muted ? 0f : Math.Max(0f, Math.Min(1f, Src.Volume)) * m;
+            float p = Math.Max(-1f, Math.Min(1f, Src.Pan));
+            fl = v * Math.Min(1f, 1f - p);
+            fr = v * Math.Min(1f, 1f + p);
+            fo = v;
+        }
+
+        void Pass(bool restore)
+        {
+            string want = DeviceId != null ? DeviceId() : "";
+            if (!restore && want != curDevice)
+            {
+                // スピーカーが変わった：前のスピーカーのアプリは元に戻してから切り替え
+                if (curDevice != null) { try { Walk(curDevice, true); } catch { } }
+                infos.Clear();
+                curDevice = want;
+            }
+            if (curDevice != null) Walk(curDevice, restore);
+        }
+
+        void Walk(string deviceId, bool restore)
+        {
+            IMMDeviceEnumerator en = null;
+            IMMDevice dev = null;
+            IAudioSessionManager2 mgr = null;
+            IAudioSessionEnumerator se = null;
+            float fl, fr, fo;
+            Factors(out fl, out fr, out fo);
+            float peak = 0;
+            int n = 0, active = 0;
+            HashSet<string> seen = new HashSet<string>();
+            try
+            {
+                en = (IMMDeviceEnumerator)new MMDeviceEnumeratorCom();
+                if (string.IsNullOrEmpty(deviceId)) en.GetDefaultAudioEndpoint(0, 1, out dev);
+                else en.GetDevice(deviceId, out dev);
+                object o;
+                dev.Activate(ref IID_SessionManager2, 23, IntPtr.Zero, out o);
+                mgr = (IAudioSessionManager2)o;
+                mgr.GetSessionEnumerator(out se);
+                se.GetCount(out n);
+                for (int i = 0; i < n; i++)
+                {
+                    object so = null;
+                    try
+                    {
+                        se.GetSession(i, out so);
+                        IAudioSessionControl2 sc = (IAudioSessionControl2)so;
+                        int state;
+                        sc.GetState(out state);
+                        if (state == 2) continue;                 // 終了したセッション
+                        int pid;
+                        sc.GetProcessId(out pid);
+                        if (pid == myPid) continue;               // このソフト自身の音は対象外
+                        if (TestOnlyPid != 0 && pid != TestOnlyPid) continue;
+                        string key;
+                        sc.GetSessionInstanceIdentifier(out key);
+                        if (key == null) continue;
+                        seen.Add(key);
+                        if (state == 1) active++;
+
+                        try
+                        {
+                            float pv;
+                            ((IAudioMeterInformation)so).GetPeakValue(out pv);
+                            if (pv > peak) peak = pv;
+                        }
+                        catch { }
+
+                        IChannelAudioVolume cv = (IChannelAudioVolume)so;
+                        Info info;
+                        if (!infos.TryGetValue(key, out info))
+                        {
+                            int cc;
+                            cv.GetChannelCount(out cc);
+                            if (cc <= 0) continue;
+                            info = new Info { Orig = new float[cc], LastSet = new float[cc] };
+                            for (int c = 0; c < cc; c++) cv.GetChannelVolume(c, out info.Orig[c]);
+                            infos[key] = info;
+                        }
+
+                        if (restore)
+                        {
+                            if (!info.Applied) continue;
+                            for (int c = 0; c < info.Orig.Length; c++)
+                            {
+                                float cur;
+                                cv.GetChannelVolume(c, out cur);
+                                if (Math.Abs(cur - info.LastSet[c]) < 0.01f) cv.SetChannelVolume(c, info.Orig[c], ref Ctx);
+                            }
+                            info.Applied = false;
+                            continue;
+                        }
+
+                        // 何も変えていないアプリには触らない
+                        if (!info.Applied && fl == 1f && fr == 1f && fo == 1f) continue;
+                        for (int c = 0; c < info.Orig.Length; c++)
+                        {
+                            float f = info.Orig.Length == 1 ? Math.Max(fl, fr) : c == 0 ? fl : c == 1 ? fr : fo;
+                            float cur;
+                            cv.GetChannelVolume(c, out cur);
+                            // ほかの方法（Windows の音量ミキサーなど）で変えられていたら、それを新しい基準にする
+                            if (info.Applied && Math.Abs(cur - info.LastSet[c]) > 0.01f)
+                                info.Orig[c] = f > 0.01f ? Math.Min(1f, cur / f) : cur;
+                            float target = info.Orig[c] * f;
+                            if (!info.Applied || Math.Abs(cur - target) > 0.001f) cv.SetChannelVolume(c, target, ref Ctx);
+                            info.LastSet[c] = target;
+                        }
+                        info.Applied = true;
+                    }
+                    catch { }
+                    finally { CoreAudio.Release(so); }
+                }
+            }
+            finally
+            {
+                CoreAudio.Release(se);
+                CoreAudio.Release(mgr);
+                CoreAudio.Release(dev);
+                CoreAudio.Release(en);
+            }
+            if (!restore)
+            {
+                foreach (string k in infos.Keys.Where(k => !seen.Contains(k)).ToList()) infos.Remove(k);
+                SessionCount = seen.Count;
+                Src.PushPeak(peak);
+            }
+        }
+    }
+
+    // =====================================================================
     //  鳴らす係
     // =====================================================================
     class Receiver
@@ -1390,6 +1643,7 @@ namespace LanSpeaker
         public Func<string, bool> SavedMute;
         public Func<string, int> SavedPan;
         readonly string name = Environment.MachineName;
+        public readonly LocalAudio Local = new LocalAudio();
         float[] mixF = new float[0];
         float masterPeak, limEnv;
 
@@ -1415,6 +1669,9 @@ namespace LanSpeaker
             running = true;
             Thread t1 = new Thread(NetLoop); t1.IsBackground = true; t1.Priority = ThreadPriority.AboveNormal; t1.Start();
             Thread t2 = new Thread(OutLoop); t2.IsBackground = true; t2.Priority = ThreadPriority.Highest; t2.Start();
+            Local.DeviceId = () => outputDeviceId;
+            Local.MasterVolume = () => Master;
+            Local.Start();
             return true;
         }
 
@@ -1422,6 +1679,7 @@ namespace LanSpeaker
         {
             running = false;
             try { if (udp != null) udp.Close(); } catch { }
+            Local.Stop();   // このPCのアプリの音量を元に戻す
         }
 
         public SourceStream[] Snapshot()
@@ -1871,7 +2129,8 @@ namespace LanSpeaker
             toC = MakeLink("真ん中", 0, small);
             toR = MakeLink("右だけ", 100, small);
 
-            vol.Value = Math.Max(0, Math.Min(200, (int)Math.Round(s.Volume * 100)));
+            if (s.IsLocal) { vol.Maximum = 100; nameLbl.ForeColor = Color.FromArgb(40, 112, 235); }
+            vol.Value = Math.Max(0, Math.Min(vol.Maximum, (int)Math.Round(s.Volume * 100)));
             pan.Value = Math.Max(-100, Math.Min(100, (int)Math.Round(s.Pan * 100)));
             mute.Checked = s.Muted;
             vol.ValueChanged += delegate { Src.Volume = vol.Value / 100f; UpdateLabels(); if (Changed != null) Changed(Src); };
@@ -1936,6 +2195,15 @@ namespace LanSpeaker
         {
             string n = Src.Name;
             if (nameLbl.Text != n) nameLbl.Text = n;
+            if (Src.IsLocal)
+            {
+                string ls = (Src.IsPlaying ? "♪ 再生中" : "無音") + "   このPCで鳴っているアプリの音";
+                if (statusLbl.Text != ls) statusLbl.Text = ls;
+                statusLbl.ForeColor = Src.IsPlaying ? Color.FromArgb(30, 140, 85) : Color.FromArgb(110, 118, 130);
+                if (mute.Checked != Src.Muted) mute.Checked = Src.Muted;
+                Meter.Push(Src.Muted ? 0 : Src.TakePeak());
+                return;
+            }
             string st = (Src.IsPlaying ? "♪ 再生中" : "無音（待機中）");
             IPAddress a = Src.Addr;
             if (a != null && Src.Named) st += "   " + a;
@@ -2193,6 +2461,10 @@ namespace LanSpeaker
             receiver.SavedVolume = n => Settings.GetInt("vol." + n, 100);
             receiver.SavedMute = n => Settings.Get("mute." + n, "0") == "1";
             receiver.SavedPan = n => Settings.GetInt("pan." + n, 0);
+            SourceStream ls = receiver.Local.Src;
+            ls.Volume = Math.Min(100, Settings.GetInt("vol." + ls.Name, 100)) / 100f;
+            ls.Muted = Settings.Get("mute." + ls.Name, "0") == "1";
+            ls.Pan = Settings.GetInt("pan." + ls.Name, 0) / 100f;
             receiver.Master = Settings.GetInt("master", 100) / 100f;
             List<KeyValuePair<string, string>> devs = CoreAudio.RenderDevices();
             string savedDev = Settings.Get("outdev2", "");
@@ -2215,7 +2487,7 @@ namespace LanSpeaker
                 Margin = new Padding(0, P(6), 0, 0), BackColor = Color.White
             };
             srcFlow.Resize += delegate { FitRows(); };
-            emptyLbl = L("まだ音を送ってくるPCがありません。\n\n音を送りたいPCで LanSpeaker.exe を起動し、\n「このPCの音を送る」を選ぶと、ここに表示されます。",
+            emptyLbl = L("ほかのPCからはまだ音が届いていません。\n音を送りたいPCで LanSpeaker.exe を起動し、\n「このPCの音を送る」を選ぶと、ここに表示されます。",
                 Font, Gray);
             emptyLbl.Margin = new Padding(P(4), P(10), 0, 0);
             srcFlow.Controls.Add(emptyLbl);
@@ -2285,7 +2557,8 @@ namespace LanSpeaker
             }
             SourceRow.ExtraLatencyMs = receiver.OutputLatencyMs + 12;
 
-            SourceStream[] list = receiver.Snapshot();
+            SourceStream[] remote = receiver.Snapshot();
+            SourceStream[] list = new[] { receiver.Local.Src }.Concat(remote).ToArray();
             bool same = list.Length == rows.Count && list.All(s => rows.ContainsKey(s.Id));
             if (!same)
             {
@@ -2299,12 +2572,13 @@ namespace LanSpeaker
                     rows[s.Id] = r;
                     srcFlow.Controls.Add(r);
                 }
-                emptyLbl.Visible = list.Length == 0;
+                emptyLbl.Visible = remote.Length == 0;
+                srcFlow.Controls.SetChildIndex(emptyLbl, srcFlow.Controls.Count - 1);
                 FitRows();
                 srcFlow.ResumeLayout();
             }
             foreach (SourceRow r in rows.Values) r.Refresh2();
-            rxCount.Text = list.Length == 0 ? "届いている音" : "届いている音（" + list.Length + "台）";
+            rxCount.Text = remote.Length == 0 ? "鳴らしている音" : "鳴らしている音（ほかのPC " + remote.Length + "台）";
             masterMeter.Push(receiver.TakeMasterPeak());
         }
 
@@ -2483,6 +2757,29 @@ namespace LanSpeaker
                 }
                 sb.AppendLine("  (expect -1: 0.300/0.000, -0.5: 0.350/0.100, 0: 0.400/0.200, +0.5: 0.200/0.250, +1: 0.000/0.300)");
 
+                // 1c) このPC自身のアプリの音量・左右（無音を流すダミーアプリだけを操作）
+                {
+                    Process dummy = Process.Start(new ProcessStartInfo(Application.ExecutablePath, "--dummy-app 12") { UseShellExecute = false });
+                    Thread.Sleep(1500);
+                    sb.AppendLine("local: dummy before   " + ReadVolumes(dummy.Id));
+                    LocalAudio la = new LocalAudio();
+                    la.TestOnlyPid = dummy.Id;
+                    la.DeviceId = () => "";
+                    la.Src.Volume = 0.5f; la.Src.Pan = 1f;
+                    la.Start();
+                    Thread.Sleep(800);
+                    sb.AppendLine("local: vol50 right   " + ReadVolumes(dummy.Id) + "  (expect L=0.00 R=0.50)");
+                    la.Src.Pan = -0.5f;
+                    Thread.Sleep(800);
+                    sb.AppendLine("local: vol50 pan-0.5 " + ReadVolumes(dummy.Id) + "  (expect L=0.50 R=0.25)");
+                    la.Src.Muted = true;
+                    Thread.Sleep(800);
+                    sb.AppendLine("local: muted         " + ReadVolumes(dummy.Id) + "  (expect 0/0)");
+                    la.Stop();
+                    sb.AppendLine("local: after stop    " + ReadVolumes(dummy.Id) + "  (expect same as before)  error=" + (la.Error ?? "-"));
+                    try { dummy.Kill(); } catch { }
+                }
+
                 // 2) ネットワークのゆらぎを再現したシミュレーション
                 sb.AppendLine(Simulate("wired (drift +80ppm, jitter 2ms)", 80e-6, 2, 0, 0, 0, 1, 120));
                 sb.AppendLine(Simulate("wifi  (drift -80ppm, jitter 20ms, 150ms stall every 15s, loss 0.2%)", -80e-6, 20, 15, 150, 0.002, 2, 180));
@@ -2521,6 +2818,38 @@ namespace LanSpeaker
             catch (Exception ex) { sb.AppendLine("EXCEPTION: " + ex); }
             File.WriteAllText(report, sb.ToString(), Encoding.UTF8);
             try { File.Delete(Settings.FilePath); } catch { }
+        }
+
+        // 指定プロセスの音のセッションの左右音量を読む
+        static string ReadVolumes(int pid)
+        {
+            IMMDeviceEnumerator en = (IMMDeviceEnumerator)new MMDeviceEnumeratorCom();
+            IMMDevice dev; en.GetDefaultAudioEndpoint(0, 1, out dev);
+            Guid iid = new Guid("77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F");
+            object o; dev.Activate(ref iid, 23, IntPtr.Zero, out o);
+            IAudioSessionEnumerator se; ((IAudioSessionManager2)o).GetSessionEnumerator(out se);
+            int n; se.GetCount(out n);
+            for (int i = 0; i < n; i++)
+            {
+                object so; se.GetSession(i, out so);
+                int sp; ((IAudioSessionControl2)so).GetProcessId(out sp);
+                if (sp != pid) continue;
+                IChannelAudioVolume cv = (IChannelAudioVolume)so;
+                int cc; cv.GetChannelCount(out cc);
+                float l, r; cv.GetChannelVolume(0, out l); cv.GetChannelVolume(Math.Min(1, cc - 1), out r);
+                return "ch=" + cc + " L=" + l.ToString("0.00") + " R=" + r.ToString("0.00");
+            }
+            return "(session not found)";
+        }
+
+        // テスト用ダミーアプリ：無音を流すだけ
+        public static void DummyApp(int seconds)
+        {
+            using (WasapiPlayer wp = new WasapiPlayer(""))
+            {
+                Stopwatch sw = Stopwatch.StartNew();
+                while (sw.Elapsed.TotalSeconds < seconds) wp.Pump(delegate (float[] b, int n) { Array.Clear(b, 0, n * 2); });
+            }
         }
 
         // 送信 → ネットワーク（ゆらぎ・詰まり・欠落）→ 受信バッファ → 出力 を時間を進めながら再現
@@ -2646,6 +2975,7 @@ namespace LanSpeaker
             if (args.Length >= 2 && args[0] == "--make-icon") { IconArt.SaveIco(args[1]); return; }
             if (args.Length >= 2 && args[0] == "--selftest") { SelfTest.Run(args[1]); return; }
             if (args.Length >= 2 && args[0] == "--screens") { SelfTest.Screens(args[1]); return; }
+            if (args.Length >= 2 && args[0] == "--dummy-app") { SelfTest.DummyApp(int.Parse(args[1])); return; }
 #endif
 
             bool startMinimized = StartupState.Minimized();
